@@ -982,6 +982,9 @@ def discover_via_tagging_api(regions, tag_types=None, max_workers=None):
         global_tagging_region=GLOBAL_TAGGING_REGION,
         global_tagging_region_overrides=GLOBAL_TAGGING_REGION_OVERRIDES,
         tag_api_region_delay=TAG_API_REGION_DELAY,
+        tag_api_max_retries=TAG_WRITE_MAX_RETRIES,
+        is_throttling_exception=is_throttling_exception,
+        retry_backoff_seconds=retry_backoff_seconds,
     )
 
 
@@ -1004,6 +1007,10 @@ def fetch_tags_for_arns(items, max_workers=None):
         chunked=chunked,
         tag_fetch_workers=TAG_FETCH_WORKERS,
         verbose=lambda: _VERBOSE,
+        tag_api_arn_lookup_batch_size=TAG_API_ARN_LOOKUP_BATCH_SIZE,
+        tag_api_max_retries=TAG_WRITE_MAX_RETRIES,
+        is_throttling_exception=is_throttling_exception,
+        retry_backoff_seconds=retry_backoff_seconds,
     )
 
 

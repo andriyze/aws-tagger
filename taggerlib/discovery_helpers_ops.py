@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import time
 
 import boto3
+from botocore.exceptions import ClientError
 
 from . import constants
 from .utils import (
@@ -25,8 +26,31 @@ def _default_retry_backoff_seconds(attempt):
     return min(8.0, 0.5 * (2 ** max(0, attempt - 1)))
 
 
-def _default_is_throttling_exception(_exc):
-    return False
+_THROTTLE_ERROR_CODES = {
+    'Throttling',
+    'ThrottlingException',
+    'ThrottledException',
+    'TooManyRequestsException',
+    'RequestLimitExceeded',
+    'RateExceeded',
+}
+
+
+def _default_is_throttling_exception(exc):
+    if isinstance(exc, ClientError):
+        err = exc.response.get('Error', {})
+        code = (err.get('Code') or '').strip()
+        msg = (err.get('Message') or '').lower()
+    else:
+        code = ''
+        msg = (str(exc) or '').lower()
+    return (
+        code in _THROTTLE_ERROR_CODES
+        or 'throttl' in msg
+        or 'rate exceeded' in msg
+        or 'too many requests' in msg
+        or 'request limit exceeded' in msg
+    )
 
 
 def _default_is_access_denied_exception(_exc):
@@ -420,6 +444,10 @@ def _discover_tagging_api_region(
     global_tagging_region=constants.DEFAULT_GLOBAL_TAGGING_REGION,
     global_tagging_region_overrides=None,
     tag_api_region_delay=constants.DEFAULT_TAG_API_REGION_DELAY,
+    tag_api_max_retries=constants.DEFAULT_TAG_WRITE_MAX_RETRIES,
+    is_throttling_exception=None,
+    retry_backoff_seconds=None,
+    verbose=False,
 ):
     """
     Fetch tagged resources in one region via Tagging API.
@@ -427,6 +455,8 @@ def _discover_tagging_api_region(
     """
     arn_service = arn_service or _default_arn_service
     global_tagging_region_overrides = dict(global_tagging_region_overrides or {})
+    is_throttling_exception = is_throttling_exception or _default_is_throttling_exception
+    retry_backoff_seconds = retry_backoff_seconds or _default_retry_backoff_seconds
 
     items = []
     tags_by_arn = {}
@@ -448,12 +478,38 @@ def _discover_tagging_api_region(
 
         # Keep partial results if a later page fails.
         page_iterator = iter(paginator.paginate(**paginate_args))
+        page_attempt = 0
         while True:
             try:
                 page = next(page_iterator)
+                page_attempt = 0
             except StopIteration:
                 break
             except Exception as e:
+                if is_throttling_exception(e):
+                    page_attempt += 1
+                    if page_attempt > tag_api_max_retries:
+                        if type_batch:
+                            batch_label = ','.join(type_batch[:3])
+                            if len(type_batch) > 3:
+                                batch_label += ',...'
+                            errors.append(
+                                f"{region} [types: {batch_label}] — throttled after "
+                                f"{tag_api_max_retries} retries"
+                            )
+                        else:
+                            errors.append(
+                                f"{region} — throttled after {tag_api_max_retries} retries"
+                            )
+                        break
+                    sleep_s = retry_backoff_seconds(page_attempt)
+                    if _is_verbose(verbose):
+                        print(
+                            f"    RETRY {region} Tagging API page in {sleep_s:.2f}s "
+                            f"(attempt {page_attempt}/{tag_api_max_retries})"
+                        )
+                    time.sleep(sleep_s)
+                    continue
                 if type_batch:
                     batch_label = ','.join(type_batch[:3])
                     if len(type_batch) > 3:
@@ -476,8 +532,11 @@ def _discover_tagging_api_region(
                     tag_region = region
                 items.append({'arn': arn, 'region': tag_region, 'resource_region': region})
                 tags_by_arn[arn] = tags
-                if tag_api_region_delay > 0:
-                    time.sleep(tag_api_region_delay)
+
+            # Rate-limit once per API page, not once per returned resource.
+            # Per-resource sleeps can make large accounts unreasonably slow.
+            if tag_api_region_delay > 0:
+                time.sleep(tag_api_region_delay)
 
     return items, tags_by_arn, errors
 
@@ -495,6 +554,9 @@ def discover_via_tagging_api(
     global_tagging_region=constants.DEFAULT_GLOBAL_TAGGING_REGION,
     global_tagging_region_overrides=None,
     tag_api_region_delay=constants.DEFAULT_TAG_API_REGION_DELAY,
+    tag_api_max_retries=constants.DEFAULT_TAG_WRITE_MAX_RETRIES,
+    is_throttling_exception=None,
+    retry_backoff_seconds=None,
 ):
     """
     Discover tagged resources via Resource Groups Tagging API in parallel.
@@ -510,6 +572,10 @@ def discover_via_tagging_api(
                 global_tagging_region=global_tagging_region,
                 global_tagging_region_overrides=global_tagging_region_overrides,
                 tag_api_region_delay=tag_api_region_delay,
+                tag_api_max_retries=tag_api_max_retries,
+                is_throttling_exception=is_throttling_exception,
+                retry_backoff_seconds=retry_backoff_seconds,
+                verbose=verbose,
             )
 
     all_items = []
@@ -556,7 +622,18 @@ def discover_via_tagging_api(
     return all_items, all_tags, all_errors
 
 
-def _fetch_tags_for_region(region, arns, *, boto_config=None, chunked=_default_chunked):
+def _fetch_tags_for_region(
+    region,
+    arns,
+    *,
+    boto_config=None,
+    chunked=_default_chunked,
+    tag_api_arn_lookup_batch_size=constants.DEFAULT_TAG_API_ARN_LOOKUP_BATCH_SIZE,
+    tag_api_max_retries=constants.DEFAULT_TAG_WRITE_MAX_RETRIES,
+    is_throttling_exception=None,
+    retry_backoff_seconds=None,
+    verbose=False,
+):
     """
     Fetch current tags for ARNs in one region via Tagging API.
     Returns (tags_by_arn, errors).
@@ -564,16 +641,37 @@ def _fetch_tags_for_region(region, arns, *, boto_config=None, chunked=_default_c
     tags_by_arn = {}
     errors = []
     client = boto3.client('resourcegroupstaggingapi', region_name=region, config=boto_config)
+    is_throttling_exception = is_throttling_exception or _default_is_throttling_exception
+    retry_backoff_seconds = retry_backoff_seconds or _default_retry_backoff_seconds
 
-    for batch in chunked(arns, 100):
-        try:
-            response = client.get_resources(ResourceARNList=batch)
-            for r in response.get('ResourceTagMappingList', []):
-                tags_by_arn[r['ResourceARN']] = {
-                    t['Key']: t['Value'] for t in r.get('Tags', [])
-                }
-        except Exception as e:
-            errors.append(f"{region} — {e}")
+    for batch in chunked(arns, tag_api_arn_lookup_batch_size):
+        attempt = 0
+        while True:
+            try:
+                response = client.get_resources(ResourceARNList=batch)
+                for r in response.get('ResourceTagMappingList', []):
+                    tags_by_arn[r['ResourceARN']] = {
+                        t['Key']: t['Value'] for t in r.get('Tags', [])
+                    }
+                break
+            except Exception as e:
+                if is_throttling_exception(e):
+                    attempt += 1
+                    if attempt > tag_api_max_retries:
+                        errors.append(
+                            f"{region} — throttled after {tag_api_max_retries} retries"
+                        )
+                        break
+                    sleep_s = retry_backoff_seconds(attempt)
+                    if _is_verbose(verbose):
+                        print(
+                            f"    RETRY {region} tag fetch batch ({len(batch)} ARNs) in "
+                            f"{sleep_s:.2f}s (attempt {attempt}/{tag_api_max_retries})"
+                        )
+                    time.sleep(sleep_s)
+                    continue
+                errors.append(f"{region} — {e}")
+                break
 
     return tags_by_arn, errors
 
@@ -587,6 +685,10 @@ def fetch_tags_for_arns(
     tag_fetch_workers=constants.DEFAULT_TAG_FETCH_WORKERS,
     verbose=False,
     fetch_tags_for_region_fn=None,
+    tag_api_arn_lookup_batch_size=constants.DEFAULT_TAG_API_ARN_LOOKUP_BATCH_SIZE,
+    tag_api_max_retries=constants.DEFAULT_TAG_WRITE_MAX_RETRIES,
+    is_throttling_exception=None,
+    retry_backoff_seconds=None,
 ):
     """
     Fetch current tags for resource items via Tagging API in parallel.
@@ -599,6 +701,11 @@ def fetch_tags_for_arns(
                 arns,
                 boto_config=boto_config,
                 chunked=chunked,
+                tag_api_arn_lookup_batch_size=tag_api_arn_lookup_batch_size,
+                tag_api_max_retries=tag_api_max_retries,
+                is_throttling_exception=is_throttling_exception,
+                retry_backoff_seconds=retry_backoff_seconds,
+                verbose=verbose,
             )
 
     tags_by_arn = {}
