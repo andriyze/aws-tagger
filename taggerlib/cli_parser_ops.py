@@ -42,9 +42,10 @@ Examples:
   %(prog)s --tag Owner:platform-team --tag Environment:production
   %(prog)s --replace Owner:old-team=new-team
   %(prog)s --tag Owner:platform-team --force
-  %(prog)s --no-auto-setup --dry-run
+  %(prog)s --auto-setup --dry-run
   %(prog)s --discovery tagging-api --dry-run
   %(prog)s --all-types --dry-run
+  %(prog)s --full --dry-run
   %(prog)s --all-types --coverage-report --dry-run
   %(prog)s --name product1 --tag Owner:platform-team --dry-run
   %(prog)s --inherit-parent-tags --tag Owner:platform-team --dry-run
@@ -64,6 +65,9 @@ Examples:
                              'exactly matches old. Can specify multiple times.')
     parser.add_argument('--force', action='store_true',
                         help='Overwrite existing tag values (applies to --tag, not --replace).')
+    parser.add_argument('--yes', action='store_true',
+                        help='Skip interactive confirmation prompts and allow write operations '
+                             'in non-interactive environments (use with care).')
 
     # --- Output and reporting ---
     parser.add_argument('--output', default='arns.txt',
@@ -71,7 +75,8 @@ Examples:
     parser.add_argument('--debug', action='store_true',
                         help='Save ARN list and full JSON report to disk (requires --output path).')
     parser.add_argument('--dry-run', action='store_true',
-                        help='Show what would happen without making any AWS API changes.')
+                        help='Show what would happen without AWS tag writes. '
+                             'Note: --auto-setup can still perform RE setup calls.')
     parser.add_argument('--verbose', action='store_true',
                         help='Show per-resource SKIP reasons, per-type/region RE detail, '
                              'and per-region tag-fetch progress. Without this flag, '
@@ -86,6 +91,9 @@ Examples:
     parser.add_argument('--all-types', action='store_true',
                         help='Include all resource types supported by RE / Tagging API '
                              '(no resource type filter). Significantly increases scan time.')
+    parser.add_argument('--full', action='store_true',
+                        help='Broad discovery/write mode: implies --auto-setup, --all-types, '
+                             'and --inherit-parent-tags.')
     parser.add_argument('--name',
                         help='Only target resources whose ARN contains this substring '
                              '(case-insensitive). Useful for scoping to a single product or team.')
@@ -96,9 +104,12 @@ Examples:
                         help='Discovery mode. auto (default) = RE primary + Tagging API supplement. '
                              'resource-explorer = RE only (may miss unindexed regions). '
                              'tagging-api = Tagging API only (faster but misses untagged resources).')
-    parser.add_argument('--no-auto-setup', action='store_true',
-                        help='Skip automatic Resource Explorer indexing setup. Use if your IAM '
-                             'role lacks iam:CreateServiceLinkedRole.')
+    parser.add_argument('--auto-setup', action='store_true',
+                        help='Run Resource Explorer indexing setup before discovery '
+                             '(CreateResourceExplorerSetup). Disabled by default.')
+    parser.add_argument('--no-auto-setup', dest='auto_setup', action='store_false',
+                        help=argparse.SUPPRESS)
+    parser.set_defaults(auto_setup=False)
     parser.add_argument('--resource-explorer-region', default=resource_explorer_default_region,
                         help='Region for the RE aggregator index (default: us-east-1).')
     parser.add_argument('--resource-explorer-view-arn',
@@ -147,12 +158,20 @@ Examples:
                              'Force-writes all saved tag values. Does not run discovery — '
                              'applies directly to the ARNs in the state file. '
                              'Supports --dry-run to preview without making changes.')
+    parser.add_argument('--restore-clear-empty', action='store_true',
+                        help='With --restore-state, also clear current non-aws:* tags for '
+                             'snapshot entries where tags_before was empty ({}). '
+                             'Without this flag, empty snapshot entries are not cleared.')
+    parser.add_argument('--allow-restore-account-mismatch', action='store_true',
+                        help='Allow --restore-state even when the state file account ID does not '
+                             'match the current caller account ID. Use only for intentional '
+                             'cross-account restore scenarios.')
     parser.add_argument('--remove-tag', action='append', metavar='KEY',
                         help='Remove a tag key from every discovered resource that has it. '
                              'Repeatable for multiple keys. Supports --dry-run to preview. '
                              'Useful for cleanup after accidental tag writes.')
     parser.add_argument('--native-tag-adapters', action='store_true',
-                        help='When tag:TagResources rejects a resource as unsupported, '
+                        help='When Tagging API write/removal calls reject a resource as unsupported, '
                              'retry that ARN with service-native tagging APIs '
                              '(supported: ec2, s3, lambda, logs, rds, '
                              'elasticloadbalancing, eks, dynamodb).')

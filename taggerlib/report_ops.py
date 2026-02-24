@@ -5,6 +5,7 @@ Extracted from tagger.py to reduce monolith size while preserving behavior.
 """
 
 import json
+import os
 from datetime import datetime, timezone
 
 from .utils import is_verbose as _is_verbose
@@ -18,8 +19,10 @@ def write_report(resources, stats, output_file):
 
     Only called when --debug is passed.
     """
-    with open(output_file, 'w') as f:
+    fd = os.open(output_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
         f.write('\n'.join(r['arn'] for r in resources))
+    os.chmod(output_file, 0o600)
     print(f"Saved {len(resources)} ARNs to {output_file}")
 
     report_file = output_file.rsplit('.', 1)[0] + '_report.json'
@@ -40,8 +43,10 @@ def write_report(resources, stats, output_file):
             for r in resources
         ],
     }
-    with open(report_file, 'w') as f:
+    fd = os.open(report_file, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
         json.dump(report, f, indent=2, default=str)
+    os.chmod(report_file, 0o600)
     print(f"Saved report to {report_file}")
 
 

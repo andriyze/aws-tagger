@@ -7,9 +7,40 @@ the CLI module so behavior stays identical while reducing monolith size.
 
 from datetime import datetime, timezone
 import json
+import os
+import re
 
 
-def save_state(resources, output_file, account, invocation):
+def _write_json_private(path, payload):
+    """Write JSON payload with restrictive file permissions (owner read/write)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
+        json.dump(payload, f, indent=2, default=str)
+    os.chmod(path, 0o600)
+
+
+def _infer_account_id_from_resources(state_resources):
+    """
+    Infer account ID from state resource ARNs when explicit metadata is absent.
+    Returns account ID string when uniquely inferable, else None.
+    """
+    ids = set()
+    for entry in state_resources or []:
+        arn = (entry or {}).get('arn') if isinstance(entry, dict) else None
+        if not arn or not isinstance(arn, str):
+            continue
+        parts = arn.split(':', 5)
+        if len(parts) < 5:
+            continue
+        account = parts[4]
+        if re.fullmatch(r'\d{12}', account or ''):
+            ids.add(account)
+    if len(ids) == 1:
+        return next(iter(ids))
+    return None
+
+
+def save_state(resources, output_file, account, invocation, *, account_id=None, account_alias=None):
     """
     Persist the current tag state of all resources to a JSON file.
     Call this BEFORE tag writes to enable rollback via --restore-state.
@@ -20,6 +51,8 @@ def save_state(resources, output_file, account, invocation):
     payload = {
         'generated_at': datetime.now(timezone.utc).isoformat(),
         'account': account,
+        'account_id': account_id or 'unknown-account',
+        'account_alias': account_alias or None,
         'invocation': invocation,
         'resources': [
             {
@@ -30,15 +63,21 @@ def save_state(resources, output_file, account, invocation):
             for r in resources
         ],
     }
-    with open(output_file, 'w') as f:
-        json.dump(payload, f, indent=2, default=str)
+    _write_json_private(output_file, payload)
     print(f"State saved to {output_file} ({len(resources)} resources)")
 
 
 def load_state(state_file, arg_error):
     """
     Load a previously saved state file.
-    Returns list of {'arn', 'region', 'tags_before'} dicts.
+    Returns dict with:
+      {
+        'resources': [...],
+        'generated_at': ...,
+        'account': ...,
+        'account_id': ...,
+        'account_alias': ...,
+      }
     Exits with code 2 via arg_error if the file is missing or malformed.
     """
     try:
@@ -55,17 +94,32 @@ def load_state(state_file, arg_error):
 
     generated_at = data.get('generated_at', 'unknown')
     account = data.get('account', 'unknown')
+    account_alias = data.get('account_alias')
+    account_id = data.get('account_id')
+    if not account_id:
+        inferred = _infer_account_id_from_resources(state_resources)
+        account_id = inferred or 'unknown-account'
+
     print(
         f"Loaded state from {state_file}: "
-        f"{len(state_resources)} resources, generated {generated_at}, account {account}"
+        f"{len(state_resources)} resources, generated {generated_at}, "
+        f"account {account}, account_id {account_id}"
     )
-    return state_resources
+    return {
+        'resources': state_resources,
+        'generated_at': generated_at,
+        'account': account,
+        'account_id': account_id,
+        'account_alias': account_alias,
+    }
 
 
 def restore_tags_from_state(
     state_resources,
     *,
     dry_run,
+    clear_empty,
+    native_tag_adapters,
     fetch_tags_for_specific_arns,
     tag_resources,
     remove_tags_from_resources,
@@ -112,6 +166,11 @@ def restore_tags_from_state(
             f"  Snapshot composition: {nonempty_targets} with saved tags, "
             f"{empty_targets} with empty tag sets"
         )
+        if empty_targets and not clear_empty:
+            print(
+                "  NOTE empty-tag snapshot entries would be skipped by default. "
+                "Use --restore-clear-empty to preview destructive empty-state restore."
+            )
         return
 
     print(f"Restoring tags for {len(normalized)} resources...")
@@ -153,9 +212,18 @@ def restore_tags_from_state(
         success_count += restore_stats.get('success_count', 0)
         failed_count += restore_stats.get('failed_count', 0)
 
-    # If a resource was untagged in the snapshot, clear all current user-managed
-    # tags so rollback can return to an empty tag set.
+    # If a resource was untagged in the snapshot, optionally clear all current
+    # user-managed tags so rollback can return to an empty tag set.
+    # This path is intentionally opt-in because it is destructive.
     if empty_state_entries:
+        if not clear_empty:
+            print(
+                f"Skipping empty-tag restore for {len(empty_state_entries)} resources "
+                "(pass --restore-clear-empty to enable clearing current non-aws:* tags)."
+            )
+            print(f"Restore complete: {success_count} succeeded, {failed_count} failed.")
+            return
+
         print(
             f"Restoring empty tag state for {len(empty_state_entries)} resources "
             "(clearing current non-aws:* tags)..."
@@ -202,7 +270,12 @@ def restore_tags_from_state(
             clear_keys = sorted({k for r in to_clear for k in r['tags']})
             # dry_run is guaranteed False here (early-return above), but pass
             # through explicitly so future refactors cannot desync behavior.
-            removal_stats = remove_tags_from_resources(to_clear, clear_keys, dry_run=dry_run)
+            removal_stats = remove_tags_from_resources(
+                to_clear,
+                clear_keys,
+                dry_run=dry_run,
+                native_tag_adapters=native_tag_adapters,
+            )
             success_count += removal_stats.get('success_count', 0)
             failed_count += removal_stats.get('failed_count', 0)
         success_count += already_empty_count

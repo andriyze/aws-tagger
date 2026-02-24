@@ -618,6 +618,14 @@ def get_account_name():
     return account_ops.get_account_name(boto_config=BOTO_CONFIG)
 
 
+def get_account_identity(strict=False):
+    """Return account metadata (ID, alias, preferred display name)."""
+    return account_ops.get_account_identity(
+        boto_config=BOTO_CONFIG,
+        strict=strict,
+    )
+
+
 def enable_logging(enabled):
     """
     Redirect stdout and stderr through TeeStream so all output is written to
@@ -628,7 +636,9 @@ def enable_logging(enabled):
         return None, None, None
     account_name = sanitize_filename(get_account_name())
     log_path = f"{account_name}.txt"
-    log_file = open(log_path, 'w')
+    log_fd = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    log_file = os.fdopen(log_fd, 'w')
+    os.chmod(log_path, 0o600)
     original_stdout = sys.stdout
     original_stderr = sys.stderr
     sys.stdout = TeeStream(sys.stdout, log_file)
@@ -716,8 +726,10 @@ def save_re_cache(cache_path, items, stats, inputs):
         'items': items,
         'stats': stats,
     }
-    with open(cache_path, 'w') as f:
+    fd = os.open(cache_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w') as f:
         json.dump(payload, f, indent=2, default=str)
+    os.chmod(cache_path, 0o600)
 
 
 # Error codes returned by AWS that indicate request rate limiting.
@@ -1132,21 +1144,25 @@ def tag_resources(
 compute_removal_decisions = tag_write_ops.compute_removal_decisions
 
 
-def remove_tags_from_resources(resources, remove_keys, dry_run=False):
+def remove_tags_from_resources(resources, remove_keys, dry_run=False, native_tag_adapters=False):
     """Compatibility wrapper for batched tag removals."""
     return tag_write_ops.remove_tags_from_resources(
         resources,
         remove_keys,
         dry_run=dry_run,
+        native_tag_adapters=native_tag_adapters,
         phase=_phase,
         boto_config=BOTO_CONFIG,
         global_tagging_region=GLOBAL_TAGGING_REGION,
         tag_write_batch_size=TAG_WRITE_BATCH_SIZE,
         tag_write_batch_delay=TAG_WRITE_BATCH_DELAY,
         tag_write_max_retries=TAG_WRITE_MAX_RETRIES,
+        native_tag_adapter_services=NATIVE_TAG_ADAPTER_SERVICES,
         retry_backoff_seconds=retry_backoff_seconds,
         is_throttling_error=is_throttling_error,
         is_throttling_exception=is_throttling_exception,
+        arn_service=arn_service,
+        tagging_region_for_arn=tagging_region_for_arn,
         chunked=chunked,
     )
 
@@ -1225,21 +1241,43 @@ def validate_tag_args(tag_list, replace_list):
 # Rollback — save and restore tag state
 # =============================================================================
 
-def save_state(resources, output_file, account, invocation):
+def save_state(
+    resources,
+    output_file,
+    account,
+    invocation,
+    *,
+    account_id=None,
+    account_alias=None,
+):
     """Persist pre-write tag state for rollback."""
-    return state_ops.save_state(resources, output_file, account, invocation)
+    return state_ops.save_state(
+        resources,
+        output_file,
+        account,
+        invocation,
+        account_id=account_id,
+        account_alias=account_alias,
+    )
 
 
 def load_state(state_file):
-    """Load a saved state file and validate structure."""
+    """Load a saved state file and validate structure + metadata."""
     return state_ops.load_state(state_file, arg_error=_arg_error)
 
 
-def restore_tags_from_state(state_resources, dry_run=False):
+def restore_tags_from_state(
+    state_resources,
+    dry_run=False,
+    clear_empty=False,
+    native_tag_adapters=False,
+):
     """Restore tags from a saved state snapshot."""
     return state_ops.restore_tags_from_state(
         state_resources,
         dry_run=dry_run,
+        clear_empty=clear_empty,
+        native_tag_adapters=native_tag_adapters,
         fetch_tags_for_specific_arns=fetch_tags_for_specific_arns,
         tag_resources=tag_resources,
         remove_tags_from_resources=remove_tags_from_resources,
@@ -1276,6 +1314,11 @@ def main():
     global _VERBOSE
     _VERBOSE = args.verbose
 
+    if args.full:
+        args.auto_setup = True
+        args.all_types = True
+        args.inherit_parent_tags = True
+
     # Validate tag args BEFORE discovery — fail fast on bad input
     tags, replace_rules = validate_tag_args(args.tag, args.replace)
 
@@ -1302,6 +1345,11 @@ def main():
             "require --accounts-file"
         )
 
+    if args.restore_clear_empty and not args.restore_state:
+        _arg_error("--restore-clear-empty requires --restore-state")
+    if args.allow_restore_account_mismatch and not args.restore_state:
+        _arg_error("--allow-restore-account-mismatch requires --restore-state")
+
     # --accounts-file: orchestrate child runs and exit before single-account flow.
     if args.accounts_file:
         run_multi_account(args)
@@ -1309,8 +1357,41 @@ def main():
 
     # --restore-state: short-circuit before discovery, apply state, exit
     if args.restore_state:
-        state_resources = load_state(args.restore_state)
-        restore_tags_from_state(state_resources, dry_run=args.dry_run)
+        state_data = load_state(args.restore_state)
+        state_resources = state_data.get('resources', [])
+        state_account_id = state_data.get('account_id') or 'unknown-account'
+        if state_account_id == 'unknown-account':
+            if not args.allow_restore_account_mismatch:
+                _arg_error(
+                    "State file account ID is unknown and cannot be verified against current "
+                    "credentials. Re-run with --allow-restore-account-mismatch to override."
+                )
+            print(
+                "WARN restore account verification skipped "
+                "(state file account ID unknown; override enabled).",
+                file=sys.stderr,
+            )
+        else:
+            try:
+                current_account_id = get_account_identity(strict=True).get('account_id', 'unknown-account')
+            except Exception as e:
+                _arg_error(f"Unable to verify current account before restore: {e}")
+
+            if current_account_id != state_account_id:
+                mismatch = (
+                    f"State file account ID ({state_account_id}) does not match current "
+                    f"caller account ID ({current_account_id})"
+                )
+                if not args.allow_restore_account_mismatch:
+                    _arg_error(f"{mismatch}. Use --allow-restore-account-mismatch to override.")
+                print(f"WARN {mismatch}; proceeding due to override flag.", file=sys.stderr)
+
+        restore_tags_from_state(
+            state_resources,
+            dry_run=args.dry_run,
+            clear_empty=args.restore_clear_empty,
+            native_tag_adapters=args.native_tag_adapters,
+        )
         sys.exit(0)
 
     # Ensure per-run cache isolation in long-lived processes/tests.
@@ -1329,8 +1410,9 @@ def main():
         print_coverage_report=print_coverage_report,
         write_report=write_report,
         print_asset_decisions=print_asset_decisions,
-        get_account_name=get_account_name,
+        get_account_identity=get_account_identity,
         save_state=save_state,
+        fetch_tags_for_specific_arns=fetch_tags_for_specific_arns,
         compute_removal_decisions=compute_removal_decisions,
         remove_tags_from_resources=remove_tags_from_resources,
         compute_tagging_decisions=compute_tagging_decisions,

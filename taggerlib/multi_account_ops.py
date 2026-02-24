@@ -203,6 +203,32 @@ def assume_role_credentials(role_arn, session_name, external_id=None, duration_s
     return response['Credentials']
 
 
+def verify_assumed_role_account_id(creds, expected_account_id):
+    """
+    Validate that temporary credentials resolve to the expected AWS account ID.
+    Returns (actual_account_id, error_message_or_empty).
+    """
+    if not expected_account_id:
+        return 'unknown-account', ''
+
+    try:
+        sts = boto3.client(
+            'sts',
+            aws_access_key_id=creds.get('AccessKeyId'),
+            aws_secret_access_key=creds.get('SecretAccessKey'),
+            aws_session_token=creds.get('SessionToken'),
+        )
+        actual = sts.get_caller_identity().get('Account', 'unknown-account')
+        if actual != expected_account_id:
+            return actual, (
+                f"assumed credentials account mismatch "
+                f"(expected {expected_account_id}, got {actual})"
+            )
+        return actual, ''
+    except Exception as e:
+        return 'unknown-account', f"unable to verify assumed-role account identity: {e}"
+
+
 def run_multi_account(
     args,
     *,
@@ -256,6 +282,20 @@ def run_multi_account(
                 break
             print()
             continue
+
+        expected_account_id = account_id or parse_role_arn_account_id(role_arn)
+        actual_account_id, verify_error = verify_assumed_role_account_id(
+            creds,
+            expected_account_id,
+        )
+        if verify_error:
+            print(f"  ERROR {verify_error}")
+            failures.append((label, verify_error))
+            if not args.continue_on_account_error:
+                break
+            print()
+            continue
+        print(f"  assumed account: {actual_account_id}")
 
         child_args = list(child_base_args)
         suffix = account_id or 'unknown-account'

@@ -167,6 +167,111 @@ def _native_tag_dynamodb(arn, region, tags, *, native_client_fn):
     client.tag_resource(ResourceArn=arn, Tags=_tag_dict_to_aws_tag_list(tags))
 
 
+def _native_untag_ec2(arn, region, tag_keys, *, native_client_fn):
+    resource_id = _arn_resource_id(arn)
+    if not resource_id:
+        raise ValueError(f"Cannot parse EC2 resource ID from ARN: {arn}")
+    client = native_client_fn('ec2', region)
+    client.delete_tags(
+        Resources=[resource_id],
+        Tags=[{'Key': key} for key in sorted(set(tag_keys))],
+    )
+
+
+def _native_untag_s3_bucket(
+    arn,
+    _region,
+    tag_keys,
+    *,
+    native_client_fn,
+    global_tagging_region,
+):
+    bucket = _s3_bucket_from_arn(arn)
+    if not bucket:
+        raise ValueError(f"S3 native adapter only supports bucket ARNs: {arn}")
+
+    remove_set = set(tag_keys or [])
+    client = native_client_fn('s3', global_tagging_region)
+    existing = {}
+    try:
+        response = client.get_bucket_tagging(Bucket=bucket)
+        existing = {t['Key']: t['Value'] for t in response.get('TagSet', [])}
+    except ClientError as e:
+        err = e.response.get('Error', {})
+        code = err.get('Code', '')
+        if code not in {'NoSuchTagSet', 'NoSuchTagSetError'}:
+            raise
+        existing = {}
+
+    remaining = {
+        key: value for key, value in existing.items()
+        if key not in remove_set
+    }
+    if remaining:
+        client.put_bucket_tagging(
+            Bucket=bucket,
+            Tagging={'TagSet': _tag_dict_to_aws_tag_list(remaining)},
+        )
+    else:
+        try:
+            client.delete_bucket_tagging(Bucket=bucket)
+        except ClientError as e:
+            err = e.response.get('Error', {})
+            code = err.get('Code', '')
+            if code not in {'NoSuchTagSet', 'NoSuchTagSetError'}:
+                raise
+
+
+def _native_untag_lambda(arn, region, tag_keys, *, native_client_fn):
+    client = native_client_fn('lambda', region)
+    client.untag_resource(Resource=arn, TagKeys=list(sorted(set(tag_keys))))
+
+
+def _native_untag_logs(arn, region, tag_keys, *, native_client_fn):
+    client = native_client_fn('logs', region)
+    client.untag_resource(resourceArn=arn, tagKeys=list(sorted(set(tag_keys))))
+
+
+def _native_untag_rds(arn, region, tag_keys, *, native_client_fn):
+    client = native_client_fn('rds', region)
+    client.remove_tags_from_resource(ResourceName=arn, TagKeys=list(sorted(set(tag_keys))))
+
+
+def _native_untag_elbv2(arn, region, tag_keys, *, native_client_fn):
+    resource = _arn_parts(arn)[5]
+    tag_keys = list(sorted(set(tag_keys)))
+
+    # Classic ELB uses the "elb" API with load balancer names, not ARNs.
+    if (
+        resource.startswith('loadbalancer/')
+        and not resource.startswith('loadbalancer/app/')
+        and not resource.startswith('loadbalancer/net/')
+        and not resource.startswith('loadbalancer/gwy/')
+    ):
+        lb_name = resource.split('/', 1)[1]
+        if not lb_name:
+            raise ValueError(f"Cannot parse Classic ELB name from ARN: {arn}")
+        client = native_client_fn('elb', region)
+        client.remove_tags(
+            LoadBalancerNames=[lb_name],
+            Tags=[{'Key': key} for key in tag_keys],
+        )
+        return
+
+    client = native_client_fn('elbv2', region)
+    client.remove_tags(ResourceArns=[arn], TagKeys=tag_keys)
+
+
+def _native_untag_eks(arn, region, tag_keys, *, native_client_fn):
+    client = native_client_fn('eks', region)
+    client.untag_resource(resourceArn=arn, tagKeys=list(sorted(set(tag_keys))))
+
+
+def _native_untag_dynamodb(arn, region, tag_keys, *, native_client_fn):
+    client = native_client_fn('dynamodb', region)
+    client.untag_resource(ResourceArn=arn, TagKeys=list(sorted(set(tag_keys))))
+
+
 def has_native_tag_adapter(
     arn,
     *,
@@ -231,6 +336,56 @@ def apply_native_tag_adapter(
         return False, str(e)
 
 
+def apply_native_untag_adapter(
+    arn,
+    tag_keys,
+    fallback_region=None,
+    *,
+    arn_service=None,
+    tagging_region_for_arn=None,
+    native_client_fn=None,
+    global_tagging_region=constants.DEFAULT_GLOBAL_TAGGING_REGION,
+):
+    """
+    Try service-native untagging API for a single ARN.
+    Returns (ok: bool, error_message: str).
+    """
+    arn_service = arn_service or _default_arn_service
+    tagging_region_for_arn = tagging_region_for_arn or _default_tagging_region_for_arn
+    native_client_fn = _require_dependency('native_client_fn', native_client_fn)
+
+    service = arn_service(arn)
+    region = fallback_region or tagging_region_for_arn(arn)
+    try:
+        if service == 'ec2':
+            _native_untag_ec2(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 's3':
+            _native_untag_s3_bucket(
+                arn,
+                region,
+                tag_keys,
+                native_client_fn=native_client_fn,
+                global_tagging_region=global_tagging_region,
+            )
+        elif service == 'lambda':
+            _native_untag_lambda(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 'logs':
+            _native_untag_logs(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 'rds':
+            _native_untag_rds(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 'elasticloadbalancing':
+            _native_untag_elbv2(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 'eks':
+            _native_untag_eks(arn, region, tag_keys, native_client_fn=native_client_fn)
+        elif service == 'dynamodb':
+            _native_untag_dynamodb(arn, region, tag_keys, native_client_fn=native_client_fn)
+        else:
+            return False, f"No native adapter for service '{service}'"
+        return True, ''
+    except Exception as e:
+        return False, str(e)
+
+
 def compute_tagging_decisions(resources, new_tags, replace_rules, force=False):
     """
     Evaluate tagging decisions for every resource without making any API calls.
@@ -243,7 +398,11 @@ def compute_tagging_decisions(resources, new_tags, replace_rules, force=False):
         existing = r['tags']
         # Inherited tags are write candidates (child gaps only), but explicit
         # --tag/--replace arguments can override them.
-        tags_to_set = dict(r.get('inherited_tags') or {})
+        inherited_tags = r.get('inherited_tags') or {}
+        tags_to_set = {
+            k: v for k, v in inherited_tags.items()
+            if k not in existing
+        }
         conflicts = {}
         replace_applied = {}
 
@@ -533,6 +692,7 @@ def remove_tags_from_resources(
     resources,
     remove_keys,
     dry_run=False,
+    native_tag_adapters=False,
     *,
     phase,
     boto_config,
@@ -540,9 +700,12 @@ def remove_tags_from_resources(
     tag_write_batch_size=10,
     tag_write_batch_delay=0.5,
     tag_write_max_retries=6,
+    native_tag_adapter_services=None,
     retry_backoff_seconds,
     is_throttling_error,
     is_throttling_exception,
+    arn_service=None,
+    tagging_region_for_arn=None,
     chunked=_default_chunked,
 ):
     """
@@ -553,7 +716,12 @@ def remove_tags_from_resources(
     retry_backoff_seconds = _require_dependency('retry_backoff_seconds', retry_backoff_seconds)
     is_throttling_error = _require_dependency('is_throttling_error', is_throttling_error)
     is_throttling_exception = _require_dependency('is_throttling_exception', is_throttling_exception)
+    arn_service = arn_service or _default_arn_service
+    tagging_region_for_arn = tagging_region_for_arn or _default_tagging_region_for_arn
     chunked = chunked or _default_chunked
+    native_tag_adapter_services = set(
+        native_tag_adapter_services or constants.NATIVE_TAG_ADAPTER_SERVICES
+    )
 
     decisions = compute_removal_decisions(resources, remove_keys)
 
@@ -599,6 +767,17 @@ def remove_tags_from_resources(
 
     failed_count = 0
     success_count = 0
+    unsupported_by_service = defaultdict(int)
+    remaining_failed_by_service = defaultdict(int)
+    native_adapter_attempted = 0
+    native_adapter_succeeded = 0
+    native_adapter_failed = 0
+
+    native_client_fn = lambda service, region: _native_client(
+        service,
+        region,
+        boto_config=boto_config,
+    )
 
     for region, arn_keys in by_region.items():
         print(f"\nRemoving tags from {len(arn_keys)} resources in {region}...")
@@ -630,14 +809,54 @@ def remove_tags_from_resources(
 
                         success_count += len(pending) - len(failed)
                         throttled = []
+                        non_throttled = []
                         for fail_arn, error in failed.items():
                             code = error.get('ErrorCode', '')
                             msg = error.get('ErrorMessage', '')
                             if is_throttling_error(code, msg):
                                 throttled.append(fail_arn)
                             else:
-                                print(f"  FAIL  {fail_arn} — {msg}")
-                                failed_count += 1
+                                non_throttled.append((fail_arn, error))
+
+                        for fail_arn, error in non_throttled:
+                            code = error.get('ErrorCode', '')
+                            msg = error.get('ErrorMessage', 'Unknown')
+                            service = arn_service(fail_arn)
+                            unsupported = is_tagresources_unsupported_error(code, msg)
+                            if unsupported:
+                                unsupported_by_service[service] += 1
+
+                            should_try_native = (
+                                native_tag_adapters
+                                and has_native_tag_adapter(
+                                    fail_arn,
+                                    arn_service=arn_service,
+                                    native_tag_adapter_services=native_tag_adapter_services,
+                                )
+                                and (unsupported or code in {'InvalidParameterException', 'ValidationException'})
+                            )
+                            if should_try_native:
+                                native_adapter_attempted += 1
+                                ok, native_err = apply_native_untag_adapter(
+                                    fail_arn,
+                                    tag_keys_list,
+                                    fallback_region=region,
+                                    arn_service=arn_service,
+                                    tagging_region_for_arn=tagging_region_for_arn,
+                                    native_client_fn=native_client_fn,
+                                    global_tagging_region=global_tagging_region,
+                                )
+                                if ok:
+                                    native_adapter_succeeded += 1
+                                    success_count += 1
+                                    print(f"  NATIVE OK  {fail_arn}")
+                                    continue
+                                native_adapter_failed += 1
+                                msg = f"{msg}; native fallback failed: {native_err}"
+
+                            print(f"  FAIL  {fail_arn} — {msg}")
+                            failed_count += 1
+                            remaining_failed_by_service[service] += 1
 
                         if throttled:
                             attempt += 1
@@ -675,9 +894,42 @@ def remove_tags_from_resources(
                 time.sleep(tag_write_batch_delay)
 
     print(f"\nRemoval complete: {success_count} succeeded, {failed_count} failed.")
+    unsupported_total = sum(unsupported_by_service.values())
+    if unsupported_total:
+        print(
+            f"  UntagResources unsupported: {unsupported_total} resources across "
+            f"{len(unsupported_by_service)} services"
+        )
+        if native_tag_adapters:
+            print(
+                f"  Native adapter fallback: attempted {native_adapter_attempted}, "
+                f"succeeded {native_adapter_succeeded}, failed {native_adapter_failed}"
+            )
+        else:
+            print("  Hint: rerun with --native-tag-adapters to try service-native API fallbacks.")
+
+        top = ", ".join(
+            f"{svc}={count}" for svc, count in
+            sorted(unsupported_by_service.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        )
+        if top:
+            print(f"  Unsupported by service (top): {top}")
+
+    if remaining_failed_by_service:
+        top = ", ".join(
+            f"{svc}={count}" for svc, count in
+            sorted(remaining_failed_by_service.items(), key=lambda kv: (-kv[1], kv[0]))[:10]
+        )
+        print(f"  Remaining removal failures by service (top): {top}")
+
     return {
         'targeted': remove_count,
         'unchanged': keep_count,
         'success_count': success_count,
         'failed_count': failed_count,
+        'unsupported_by_service': dict(unsupported_by_service),
+        'native_adapter_attempted': native_adapter_attempted,
+        'native_adapter_succeeded': native_adapter_succeeded,
+        'native_adapter_failed': native_adapter_failed,
+        'remaining_failed_by_service': dict(remaining_failed_by_service),
     }

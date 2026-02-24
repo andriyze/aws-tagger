@@ -181,7 +181,7 @@ Minimum IAM permissions required:
 }
 ```
 
-> If your role lacks `iam:CreateServiceLinkedRole`, use `--no-auto-setup` to skip RE setup. Discovery will still work for already-indexed regions; unindexed regions fall back to the Tagging API.
+> RE auto-setup is opt-in. If your role lacks `iam:CreateServiceLinkedRole`, do not pass `--auto-setup`. Discovery still works for already-indexed regions; unindexed regions fall back to the Tagging API.
 
 ### Additional permissions for `--inherit-parent-tags`
 
@@ -228,6 +228,7 @@ usage: tagger.py [-h]
                  [--tag KEY:VALUE]
                  [--replace KEY:OLD=NEW]
                  [--force]
+                 [--yes]
                  [--output FILE]
                  [--debug]
                  [--dry-run]
@@ -235,9 +236,10 @@ usage: tagger.py [-h]
                  [--coverage-report]
                  [--no-type-drift-check]
                  [--all-types]
+                 [--full]
                  [--name SUBSTRING]
                  [--discovery {auto,resource-explorer,tagging-api}]
-                 [--no-auto-setup]
+                 [--auto-setup]
                  [--resource-explorer-region REGION]
                  [--resource-explorer-view-arn ARN]
                  [--no-cache]
@@ -247,6 +249,8 @@ usage: tagger.py [-h]
                  [--inherit-parent-tags]
                  [--save-state FILE]
                  [--restore-state FILE]
+                 [--restore-clear-empty]
+                 [--allow-restore-account-mismatch]
                  [--remove-tag KEY]
                  [--native-tag-adapters]
                  [--accounts-file FILE]
@@ -263,16 +267,18 @@ usage: tagger.py [-h]
 | `--tag KEY:VALUE` | Add a tag if the key is missing. Skips if the key already exists (unless `--force`). Repeatable. |
 | `--replace KEY:OLD=NEW` | Replace a tag value only when the current value exactly matches `OLD`. Repeatable. |
 | `--force` | When used with `--tag`, overwrites existing tag values. Has no effect on `--replace` (which always requires an exact match). |
-| `--dry-run` | Show all planned changes without making any AWS API writes. Enables log file output. |
+| `--yes` | Explicitly approve write operations in non-interactive environments and skip interactive confirmation prompts. |
+| `--dry-run` | Show all planned tag changes without AWS tag writes. Enables log file output. If you also pass `--auto-setup`, RE setup calls can still run. |
 | `--verbose` | Show per-resource SKIP reasons, per-type/region RE detail, and per-region tag-fetch progress. Without this flag, discovery runs silently and only aggregate counts are shown. |
 | `--coverage-report` | Print a service-level coverage summary (top discovered and targeted services) and detailed RE type coverage (supported vs configured). |
 | `--no-type-drift-check` | Disable automatic curated-type drift checks against `ListSupportedResourceTypes`. |
 | `--output FILE` | Destination file for the ARN list when `--debug` is used. Default: `arns.txt`. |
 | `--debug` | Save the ARN list and a full JSON report (including tags and stats) to disk. |
 | `--all-types` | Remove resource type filters — scan all types supported by RE / Tagging API. Significantly increases scan time. |
+| `--full` | Broad mode: implies `--auto-setup`, `--all-types`, and `--inherit-parent-tags`. |
 | `--name SUBSTRING` | Case-insensitive substring match on the full ARN. Only matching ARNs are processed. With `--inherit-parent-tags`, children of matching parents are also included even when the child ARN itself does not contain the substring. |
 | `--discovery MODE` | `auto` (default): RE + Tagging API hybrid. `resource-explorer`: RE only. `tagging-api`: Tagging API only. |
-| `--no-auto-setup` | Skip the Resource Explorer auto-setup call. Use if your role lacks `iam:CreateServiceLinkedRole`. |
+| `--auto-setup` | Run Resource Explorer auto-setup (`CreateResourceExplorerSetup`) before discovery. Disabled by default. |
 | `--resource-explorer-region` | AWS region for the RE aggregator index. Default: `us-east-1`. |
 | `--resource-explorer-view-arn` | Use a specific RE view ARN. Uses the account default view if omitted. |
 | `--no-cache` | Ignore cached RE results and force a full rescan. |
@@ -282,8 +288,10 @@ usage: tagger.py [-h]
 | `--inherit-parent-tags` | For child resources (log groups, node groups, listeners, snapshots, etc.), inherit missing tags from the parent resource. See [Tag Inheritance](#tag-inheritance). |
 | `--save-state FILE` | Before any tag writes, snapshot current tags of all targeted resources to `FILE` (JSON). Compatible with `--dry-run`. Use `--restore-state` to undo. |
 | `--restore-state FILE` | Restore tags from a `--save-state` snapshot. Short-circuits discovery — applies directly to the ARNs in the file. Supports `--dry-run`. |
+| `--restore-clear-empty` | With `--restore-state`, also clear current non-`aws:*` tags for entries where `tags_before` was empty. Disabled by default for safety. |
+| `--allow-restore-account-mismatch` | Override account-ID safety guard for `--restore-state` when snapshot account differs from current credentials. |
 | `--remove-tag KEY` | Remove one tag key from all discovered resources that currently have it. Repeatable. |
-| `--native-tag-adapters` | When `tag:TagResources` rejects a resource type as unsupported, retry that ARN using service-native APIs (supported: `ec2`, `s3`, `lambda`, `logs`, `rds`, `elasticloadbalancing`, `eks`, `dynamodb`). |
+| `--native-tag-adapters` | When Tagging API writes/removals are unsupported, retry those ARNs using service-native APIs (supported: `ec2`, `s3`, `lambda`, `logs`, `rds`, `elasticloadbalancing`, `eks`, `dynamodb`). |
 | `--accounts-file FILE` | Run one child scan/write per account in `FILE` using `sts:AssumeRole`. Preserves existing single-account behavior for each child run. |
 | `--assume-role-name ROLE` | Default role name for account IDs in `--accounts-file` (for example `OrganizationAccountAccessRole`). |
 | `--assume-role-session-prefix PREFIX` | Session name prefix used for STS in multi-account mode. Default: `tagger`. |
@@ -451,8 +459,11 @@ python3 tagger.py --discovery resource-explorer --dry-run
 # Tagging API only (faster, but misses ALL untagged resources)
 python3 tagger.py --discovery tagging-api --dry-run
 
-# Skip RE auto-setup (use when role lacks iam:CreateServiceLinkedRole)
-python3 tagger.py --no-auto-setup --dry-run
+# Run RE auto-setup explicitly
+python3 tagger.py --auto-setup --dry-run
+
+# Full mode: auto-setup + all-types + parent inheritance
+python3 tagger.py --full --dry-run
 
 # Use a specific RE aggregator region
 python3 tagger.py --resource-explorer-region eu-west-1 --dry-run
@@ -715,7 +726,7 @@ python3 tagger.py --restore-state before.json --dry-run
 python3 tagger.py --restore-state before.json
 ```
 
-> `--restore-state` force-writes **all** saved tag values to their respective ARNs. For resources that were untagged in the snapshot (`tags_before: {}`), it also clears current non-`aws:*` tags to return them to an empty-tag state. It does not run discovery — it applies directly to the ARN list in the state file.
+> `--restore-state` force-writes **all** saved tag values to their respective ARNs. For resources that were untagged in the snapshot (`tags_before: {}`), current non-`aws:*` tags are **not** cleared unless you pass `--restore-clear-empty`. It does not run discovery — it applies directly to the ARN list in the state file. By default, restore also verifies that the snapshot account ID matches your current caller account ID; override with `--allow-restore-account-mismatch` only for intentional cross-account restores.
 
 ---
 
@@ -730,6 +741,7 @@ RE discovery results are cached to `.tagger_cache/<account>_<hash>.json`. The ha
 | Cache format | JSON with `generated_at`, `inputs`, `items`, and `stats` |
 | What is cached | RE discovery results only. Live tag values are always fetched fresh. |
 | Cache invalidation | Pass `--no-cache` to force a full RE rescan |
+| Write-intent safety | Non-dry-run runs with `--tag`, `--replace`, or `--remove-tag` automatically bypass RE cache (`--no-cache` implied) |
 | TTL-based expiry | Pass `--cache-ttl 60` to expire cache after 60 minutes |
 
 > Tags are **never** cached — only the list of ARNs and their regions. Every run fetches live tag state so `--replace` and `--force` always operate on current values.
@@ -821,7 +833,7 @@ When `--debug` is passed, two files are written after the scan:
 - **Global service tagging regions** — CloudFront, Route53, and WAFv2 must be tagged via `us-east-1`. Global Accelerator must be tagged via `us-west-2`. The script handles these routing rules automatically via `GLOBAL_TAGGING_REGION_OVERRIDES`.
 - **`--replace` same-key multiple rules** — If a resource matches multiple `--replace` rules for the same tag key, only the first matching rule fires in a single run. Re-run the script for subsequent replacements.
 - **`--output` requires `--debug`** — The `--output` path is only written when `--debug` is passed. Without `--debug`, `--output` has no effect.
-- **`--restore-state` is not strict full-diff restore** — Restore now clears tags for resources that were untagged in the snapshot (`tags_before: {}`), but for resources with non-empty snapshots it still force-writes saved values without deleting extra keys added later. To fully restore, manually review and remove extra keys added between snapshot and restore.
+- **`--restore-state` is not strict full-diff restore** — For resources with non-empty snapshots, restore force-writes saved values but does not delete extra keys added later. For `tags_before: {}` entries, empty-state clearing is now opt-in via `--restore-clear-empty`.
 - **`--restore-state` + multi-account** — `--restore-state` is blocked when `--accounts-file` is used. Restore operations must be run per account with account-specific state files.
 - **Inheritance fallback limits** — If a parent is not in the discovered set, the script tries `tag:GetResources` and then service-native tag reads for common parent services. Inheritance still fails when lookups are denied, unsupported parent types are encountered, or the parent has no visible tags.
 
@@ -840,6 +852,7 @@ Errors of the form `AccessDeniedException: User ... is not authorized to perform
 | `tag:GetResources` | Required for Tagging API discovery |
 | `lambda:ListTags` / `ec2:DescribeTags` / `rds:ListTagsForResource` (and similar service-native tag-read actions) | Needed only with `--inherit-parent-tags` when parent fallback uses service-native APIs |
 | `tag:TagResources` | Required to write tags |
+| `tag:UntagResources` | Required for `--remove-tag` and empty-state restore when enabled |
 | `sts:AssumeRole` | Required only for `--accounts-file` multi-account mode (on the caller identity) |
 | `elasticfilesystem:DescribeAccessPoints` | Only needed with `--inherit-parent-tags` |
 | `backup:DescribeRecoveryPoint` | Only needed with `--inherit-parent-tags` |
@@ -853,7 +866,7 @@ Errors of the form `AccessDeniedException: User ... is not authorized to perform
 
 Tag write failures for individual resources (e.g. KMS keys requiring resource-based policies) are logged as warnings but do not abort the run.
 
-When `--native-tag-adapters` is enabled, fallback writes also require the corresponding service-native tagging permissions (for example `ec2:CreateTags`, `lambda:TagResource`, `logs:TagResource`, `rds:AddTagsToResource`, `elasticloadbalancing:AddTags`, `elb:AddTags`, `eks:TagResource`, `dynamodb:TagResource`, `s3:GetBucketTagging`, and `s3:PutBucketTagging`).
+When `--native-tag-adapters` is enabled, fallback writes/removals also require the corresponding service-native tagging permissions (for example `ec2:CreateTags`/`ec2:DeleteTags`, `lambda:TagResource`/`lambda:UntagResource`, `logs:TagResource`/`logs:UntagResource`, `rds:AddTagsToResource`/`rds:RemoveTagsFromResource`, `elasticloadbalancing:AddTags`/`elasticloadbalancing:RemoveTags`, `elb:AddTags`/`elb:RemoveTags`, `eks:TagResource`/`eks:UntagResource`, `dynamodb:TagResource`/`dynamodb:UntagResource`, `s3:GetBucketTagging`, `s3:PutBucketTagging`, and `s3:DeleteBucketTagging`).
 
 For multi-account mode, each target account role must trust the caller and allow the same read/write tagging permissions required for single-account runs.
 
@@ -861,7 +874,7 @@ For multi-account mode, each target account role must trust the caller and allow
 
 - **Indexing lag**: RE can take up to 36 hours after initial setup to index all resources. Wait and retry, or use `--discovery tagging-api` for immediate (tagged-only) results.
 - **Aggregator region mismatch**: RE indexes must have an aggregator index. If your aggregator is in a different region than `us-east-1`, pass `--resource-explorer-region <your-aggregator-region>`.
-- **No RE index in account**: Run without `--no-auto-setup` to trigger auto-setup, or create an RE index manually in the AWS console.
+- **No RE index in account**: Run with `--auto-setup` to trigger setup, or create an RE index manually in the AWS console.
 
 ### "No resources found" or fewer resources than expected
 
@@ -884,7 +897,8 @@ When running in a TTY (interactive terminal), the script prompts for confirmatio
 About to tag 158 resources. Type 'yes' to proceed:
 ```
 
-In CI/CD environments (non-TTY), the prompt is skipped automatically. Use `--dry-run` in pipelines to preview before committing.
+In CI/CD environments (non-TTY), write operations are blocked unless you pass `--yes` explicitly.
+Use `--dry-run` to preview, then run with `--yes` only after review.
 
 ### Rolling back a bulk write
 

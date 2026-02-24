@@ -181,7 +181,7 @@ def re_auto_setup(re_region, regions, *, boto_config=None):
         if 'AccessDenied' in err_str or 'CreateServiceLinkedRole' in err_str or 'UnauthorizedAccess' in err_str:
             print("  ERROR RE auto-setup failed — missing IAM permission: iam:CreateServiceLinkedRole")
             print(f"  Detail: {e}")
-            print("  Add iam:CreateServiceLinkedRole to your role, or use --no-auto-setup to skip.")
+            print("  Add iam:CreateServiceLinkedRole to your role, or run without --auto-setup.")
             print("  Without RE indexing, untagged resources may not be discovered.")
         else:
             print(f"  WARN  RE auto-setup failed: {e}")
