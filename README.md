@@ -6,10 +6,10 @@ Discovers **all** AWS resources — including untagged ones — and enforces own
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [Requirements](#requirements)
 - [IAM Permissions](#iam-permissions)
-- [Quick Start](#quick-start)
 - [All Options](#all-options)
 - [Command Examples](#command-examples)
 - [Discovery Modes](#discovery-modes)
@@ -22,6 +22,24 @@ Discovers **all** AWS resources — including untagged ones — and enforces own
 - [Output and Logging](#output-and-logging)
 - [Limitations](#limitations)
 - [Troubleshooting](#troubleshooting)
+
+---
+
+## Quick Start
+
+```bash
+# Install dependency
+pip install boto3
+
+# Dry run — scan everything, show what would be tagged, make no changes
+python3 tagger.py --dry-run
+
+# Tag all resources missing an Owner tag
+python3 tagger.py --tag Owner:platform-team
+
+# Preview before tagging
+python3 tagger.py --tag Owner:platform-team --dry-run
+```
 
 ---
 
@@ -108,7 +126,7 @@ Resource Explorer hard-caps results at **1000 per query**. When a query hits thi
 2. **Level 1** — split by tag presence: `tag:none` / `-tag:none`
 3. **Level 2** — split tagged resources by common tag keys (`Name`, `Environment`, `Owner`, etc.)
 
-If results are still capped after all splits, a warning is logged and the Tagging API supplement picks up the remainder.
+If results are still capped after all splits, discovery is marked partial. In `auto` mode, the Tagging API supplement can recover tagged overflow, but untagged overflow can still be missed.
 
 ---
 
@@ -203,24 +221,6 @@ These are non-fatal: if lookup calls fail, the child resource is tagged independ
 
 ---
 
-## Quick Start
-
-```bash
-# Install dependency
-pip install boto3
-
-# Dry run — scan everything, show what would be tagged, make no changes
-python3 tagger.py --dry-run
-
-# Tag all resources missing an Owner tag
-python3 tagger.py --tag Owner:platform-team
-
-# Preview before tagging
-python3 tagger.py --tag Owner:platform-team --dry-run
-```
-
----
-
 ## All Options
 
 ```
@@ -229,6 +229,8 @@ usage: tagger.py [-h]
                  [--replace KEY:OLD=NEW]
                  [--force]
                  [--yes]
+                 [--expected-account-id ACCOUNT_ID]
+                 [--allow-partial-discovery-write]
                  [--output FILE]
                  [--debug]
                  [--dry-run]
@@ -268,6 +270,8 @@ usage: tagger.py [-h]
 | `--replace KEY:OLD=NEW` | Replace a tag value only when the current value exactly matches `OLD`. Repeatable. |
 | `--force` | When used with `--tag`, overwrites existing tag values. Has no effect on `--replace` (which always requires an exact match). |
 | `--yes` | Explicitly approve write operations in non-interactive environments and skip interactive confirmation prompts. |
+| `--expected-account-id ACCOUNT_ID` | Optional 12-digit account guard for non-`--dry-run` writes/removals. When set, writes are refused if caller identity does not match this account ID. |
+| `--allow-partial-discovery-write` | Override the default fail-closed write guard when discovery may be partial (RE caps, unindexed RE regions, or `--discovery tagging-api`). Use with extreme care. |
 | `--dry-run` | Show all planned tag changes without AWS tag writes. Enables log file output. If you also pass `--auto-setup`, RE setup calls can still run. |
 | `--verbose` | Show per-resource SKIP reasons, per-type/region RE detail, and per-region tag-fetch progress. Without this flag, discovery runs silently and only aggregate counts are shown. |
 | `--coverage-report` | Print a service-level coverage summary (top discovered and targeted services) and detailed RE type coverage (supported vs configured). |
@@ -529,6 +533,8 @@ The Tagging API supplement in `auto` mode activates automatically when:
 - There are resource types only discoverable via Tagging API (`eks:nodegroup`, `ec2:network-interface`, `dlm:lifecycle-policy`)
 - RE failed entirely (fallback)
 
+For non-`--dry-run` writes, discovery is fail-closed by default: when discovery may be partial (for example capped RE queries, unindexed RE regions, or `--discovery tagging-api`), the run exits before writing unless `--allow-partial-discovery-write` is set.
+
 ---
 
 ## Resource Types
@@ -631,7 +637,7 @@ The following child types are re-admitted when `--inherit-parent-tags` is set. T
 - The tool's console output annotates inherited tags with `(from <parent-arn>)` for traceability. This annotation is never written to AWS.
 - A child's **own tags are never overwritten** — parent tags fill only keys the child doesn't already have.
 - `aws:*` prefixed tags are never propagated from parent to child (AWS reserved prefix).
-- Some child resources can resolve to multiple parent candidates (for example ContainerInsights ECS vs EKS cluster). The script picks the first candidate that exists in the same run's discovered parent set.
+- Some child resources can resolve to multiple parent candidates (for example ContainerInsights ECS vs EKS cluster). Inheritance proceeds only when all candidates would produce the same inherited tag payload; otherwise the child is marked unresolved (`ambiguous_parent_candidates`) and tagged independently.
 - If no discovered parent matches, the script performs fallback parent-tag lookups in two stages:
   - `tag:GetResources(ResourceARNList=...)`
   - service-native read APIs (for common services) if Tagging API lookup misses
@@ -828,7 +834,8 @@ When `--debug` is passed, two files are written after the scan:
 
 - **Resource Explorer indexing lag** — RE can take up to 36 hours after initial setup before all resources are indexed. New resources may not appear in RE for several minutes. The Tagging API supplement covers the gap for tagged resources.
 - **Untagged resources in unindexed regions** — If a region has no RE index, untagged resources there are invisible. RE auto-setup will index the region, but only after the 36-hour indexing window.
-- **1000-result cap** — RE's hard cap is 1000 results per query. The script splits queries automatically, but extremely large result sets (>1000 per tag-key split) will still be capped with a warning. The Tagging API supplement catches the tagged portion of any overflow.
+- **1000-result cap** — RE's hard cap is 1000 results per query. The script splits queries automatically, but extremely large result sets (>1000 per tag-key split) can still overflow. The Tagging API supplement catches tagged overflow; untagged overflow can still be missed.
+- **Partial discovery write guard** — Non-`--dry-run` writes are blocked when discovery may be partial (RE cap overflow, unindexed RE regions, or `--discovery tagging-api`). Override only when intentional with `--allow-partial-discovery-write`.
 - **Tagging API misses untagged resources** — `--discovery tagging-api` mode cannot find resources with no tags at all. Use `auto` or `resource-explorer` mode to catch untagged resources.
 - **Global service tagging regions** — CloudFront, Route53, and WAFv2 must be tagged via `us-east-1`. Global Accelerator must be tagged via `us-west-2`. The script handles these routing rules automatically via `GLOBAL_TAGGING_REGION_OVERRIDES`.
 - **`--replace` same-key multiple rules** — If a resource matches multiple `--replace` rules for the same tag key, only the first matching rule fires in a single run. Re-run the script for subsequent replacements.
@@ -882,6 +889,15 @@ For multi-account mode, each target account role must trust the caller and allow
 - **Resource type excluded**: Check `SKIP_ARN_PATTERNS` and `SKIP_TAG_KEYS` in the script. Add `--verbose` to see SKIP lines with reasons.
 - **Untagged resources in tagging-api mode**: `--discovery tagging-api` only returns tagged resources. Switch to `auto` mode.
 - **Cache stale**: Pass `--no-cache` to force a full RE rescan.
+
+### "Refusing write operation because discovery may be partial"
+
+This safety check blocks non-`--dry-run` writes when any of these are true:
+- RE query splits still hit the 1000-result cap
+- One or more regions are not indexed in Resource Explorer
+- `--discovery tagging-api` is selected (untagged resources are invisible)
+
+If you intentionally want to proceed anyway, add `--allow-partial-discovery-write`.
 
 ### Output is very noisy / hard to read
 
