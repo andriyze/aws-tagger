@@ -57,6 +57,12 @@ def _default_is_access_denied_exception(_exc):
     return False
 
 
+def _record_capped_warning(stats, message):
+    """Track RE cap warnings in both generic warnings and dedicated cap list."""
+    stats['warnings'].append(message)
+    stats.setdefault('re_capped_warnings', []).append(message)
+
+
 def re_search(
     client,
     query,
@@ -142,7 +148,10 @@ def re_search_with_splits(
     r_none, c_none, t_none = re_search_fn(f"{base} tag:none", view_arn)
     all_results.extend(r_none)
     if not c_none:
-        stats['warnings'].append(f"{context} untagged: {t_none} est, got {len(r_none)} (capped)")
+        _record_capped_warning(
+            stats,
+            f"{context} untagged: {t_none} est, got {len(r_none)} (capped)",
+        )
 
     r_tagged, c_tagged, t_tagged = re_search_fn(f"{base} -tag:none", view_arn)
     if c_tagged:
@@ -164,8 +173,10 @@ def re_search_with_splits(
         exclusion_parts.append(f"-tag:{tag_key}")
 
         if not c_with:
-            stats['warnings'].append(
-                f"{context} tag:{tag_key}: results capped at 1000")
+            _record_capped_warning(
+                stats,
+                f"{context} tag:{tag_key}: results capped at 1000",
+            )
 
     remaining_query = f"{base} -tag:none " + " ".join(exclusion_parts)
     r_rest, c_rest, t_rest = re_search_fn(remaining_query, view_arn)
@@ -176,8 +187,10 @@ def re_search_with_splits(
             all_results.append(r)
 
     if not c_rest:
-        stats['warnings'].append(
-            f"{context} remaining tagged: {t_rest} est, got {len(r_rest)} (capped)")
+        _record_capped_warning(
+            stats,
+            f"{context} remaining tagged: {t_rest} est, got {len(r_rest)} (capped)",
+        )
 
     return all_results
 
@@ -354,7 +367,7 @@ def discover_via_resource_explorer(
 
     items = []
     seen = set()
-    stats = {'warnings': [], 'missing_regions': []}
+    stats = {'warnings': [], 'missing_regions': [], 're_capped_warnings': []}
 
     if indexed_regions is not None:
         missing = [r for r in regions if r not in indexed_regions]

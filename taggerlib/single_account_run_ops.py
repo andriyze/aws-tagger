@@ -4,6 +4,8 @@ Single-account execution flow for tagger CLI.
 Extracted from tagger.py so main() stays focused on parse/validate/routing.
 """
 
+import os
+import re
 import sys
 from datetime import datetime, timezone
 
@@ -41,6 +43,95 @@ def _refresh_tags_before_write(resources, fetch_tags_for_specific_arns):
         'unresolved': unresolved,
         'errors': errors,
     }
+
+
+def _partial_discovery_reasons(args, stats):
+    """Return human-readable reasons why discovery may be incomplete for writes."""
+    stats = stats or {}
+    reasons = []
+    capped = list(stats.get('re_capped_warnings') or [])
+    if capped:
+        reasons.append(
+            f"Resource Explorer result caps detected in {len(capped)} query split(s)"
+        )
+    missing_regions = list(stats.get('missing_regions') or [])
+    if missing_regions:
+        reasons.append(
+            f"Resource Explorer is not indexed in: {', '.join(sorted(missing_regions))}"
+        )
+    if args.discovery == 'tagging-api' or stats.get('discovery_mode') == 'tagging-api-only':
+        reasons.append("tagging-api discovery does not include untagged resources")
+    return reasons
+
+
+def _enforce_discovery_completeness_guard(args, stats):
+    """Fail closed on non-dry-run writes when discovery may be partial."""
+    if getattr(args, 'allow_partial_discovery_write', False):
+        return
+    reasons = _partial_discovery_reasons(args, stats)
+    if not reasons:
+        return
+    print("ERROR: refusing write operation because discovery may be partial:", file=sys.stderr)
+    for reason in reasons:
+        print(f"  - {reason}", file=sys.stderr)
+    print(
+        "Re-run with --allow-partial-discovery-write to override.",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+
+def _resolve_expected_account_id(args):
+    """Resolve expected target account from child env or explicit CLI flag."""
+    env_expected = (os.environ.get('TAGGER_TARGET_ACCOUNT_ID') or '').strip()
+    cli_expected = (getattr(args, 'expected_account_id', None) or '').strip()
+    if env_expected and env_expected != 'unknown-account':
+        return env_expected, 'TAGGER_TARGET_ACCOUNT_ID'
+    if cli_expected:
+        return cli_expected, '--expected-account-id'
+    return None, ''
+
+
+def _enforce_write_account_guard(args, get_account_identity):
+    """Fail closed before writes unless target account is explicitly verified."""
+    expected_account_id, source = _resolve_expected_account_id(args)
+    if not expected_account_id:
+        print(
+            "ERROR: refusing write operation without explicit target account guard. "
+            "Pass --expected-account-id <12-digit-account-id>.",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    if not re.fullmatch(r'\d{12}', expected_account_id):
+        print(
+            f"ERROR: expected target account ID must be 12 digits (got '{expected_account_id}')",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    try:
+        identity = get_account_identity(strict=True)
+    except Exception as e:
+        print(f"ERROR: unable to resolve current caller account identity: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    actual_account_id = (identity or {}).get('account_id') or 'unknown-account'
+    if not re.fullmatch(r'\d{12}', actual_account_id):
+        print(
+            f"ERROR: current caller account ID is unknown/unexpected ('{actual_account_id}').",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    if actual_account_id != expected_account_id:
+        print(
+            "ERROR: refusing write operation due to target account mismatch "
+            f"(expected {expected_account_id}, got {actual_account_id}).",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    print(f"Write guard: verified target account {actual_account_id} ({source})")
 
 
 def run_single_account(
@@ -182,6 +273,8 @@ def run_single_account(
             print(f"  Warnings:             {len(stats['warnings'])}")
             for w in stats['warnings']:
                 print(f"    WARN  {w}")
+        if stats.get('re_capped_warnings'):
+            print(f"  RE capped queries:    {len(stats['re_capped_warnings'])}")
         if stats['missing_regions']:
             print(f"  RE missing regions:   {', '.join(stats['missing_regions'])}")
         print(f"{'=' * 60}\n")
@@ -245,6 +338,8 @@ def run_single_account(
             total_to_remove = len(removal_decisions)
 
             if not args.dry_run and total_to_remove > 0:
+                _enforce_discovery_completeness_guard(args, stats)
+                _enforce_write_account_guard(args, get_account_identity)
                 if args.yes:
                     pass
                 elif sys.stdin.isatty():
@@ -310,6 +405,8 @@ def run_single_account(
                     return
 
             if not args.dry_run and total_to_tag > 0:
+                _enforce_discovery_completeness_guard(args, stats)
+                _enforce_write_account_guard(args, get_account_identity)
                 if args.yes:
                     pass
                 elif sys.stdin.isatty():

@@ -15,6 +15,41 @@ def _require_dependency(name, value):
     return value
 
 
+def _project_inherited_tags(child_tags, parent_tags):
+    """Compute inheritable tags from parent onto child (missing keys, non-aws:*)."""
+    child_tags = child_tags or {}
+    parent_tags = parent_tags or {}
+    return {
+        k: v for k, v in parent_tags.items()
+        if k not in child_tags and not k.startswith('aws:')
+    }
+
+
+def _select_unambiguous_parent(child_tags, candidate_arns, parent_tags_by_arn):
+    """
+    Select a parent only when all candidate parents would yield identical inherited
+    tag payloads. Returns (selected_parent_arn_or_none, reason_or_empty).
+    """
+    if not candidate_arns:
+        return None, ''
+    if len(candidate_arns) == 1:
+        return candidate_arns[0], ''
+
+    first_sig = None
+    for candidate in candidate_arns:
+        projected = _project_inherited_tags(
+            child_tags,
+            parent_tags_by_arn.get(candidate, {}),
+        )
+        sig = tuple(sorted(projected.items()))
+        if first_sig is None:
+            first_sig = sig
+            continue
+        if sig != first_sig:
+            return None, 'ambiguous_parent_candidates'
+    return candidate_arns[0], ''
+
+
 def get_all_resources(
     regions,
     re_types=None,
@@ -111,6 +146,7 @@ def get_all_resources(
         'name_filter': name_filter or None,
         'errors': [],
         'warnings': [],
+        're_capped_warnings': [],
         'missing_regions': [],
         're_found': 0,
         'tagging_api_added': 0,
@@ -155,6 +191,7 @@ def get_all_resources(
                     re_stats = re_stats or {}
                     stats['discovery_mode'] = 'resource-explorer-cache'
                     stats['warnings'].extend(re_stats.get('warnings', []))
+                    stats['re_capped_warnings'].extend(re_stats.get('re_capped_warnings', []))
                     stats['missing_regions'] = re_stats.get('missing_regions', [])
                     stats['re_found'] = len(re_items)
                     cache_used = True
@@ -171,6 +208,7 @@ def get_all_resources(
                 )
                 stats['discovery_mode'] = 'resource-explorer'
                 stats['warnings'].extend(re_stats.get('warnings', []))
+                stats['re_capped_warnings'].extend(re_stats.get('re_capped_warnings', []))
                 stats['missing_regions'] = re_stats.get('missing_regions', [])
                 stats['re_found'] = len(re_items)
                 print(f"  RE total: {len(re_items)} resources found")
@@ -315,6 +353,7 @@ def get_all_resources(
         parent_index = {r['arn']: r['tags'] for r in resources}
         unresolved_resources = []
         unresolved_parent_arns = set()
+        unresolved_reason_counts = defaultdict(int)
         inherited_from_external_parent = 0
         inherited_from_native_parent = 0
 
@@ -327,22 +366,27 @@ def get_all_resources(
             if not parent_arns:
                 continue   # Not a child resource with a resolvable parent
 
-            # Keep first candidate for diagnostics, then prefer the first
-            # candidate that exists in this run's discovered parent set.
+            # Keep first candidate for diagnostics.
             resource['parent_arn'] = parent_arns[0]
-            parent_arn = next((p for p in parent_arns if p in parent_index), None)
-            if parent_arn is None:
+            discovered_candidates = [p for p in parent_arns if p in parent_index]
+            if not discovered_candidates:
                 unresolved_resources.append((resource, parent_arns))
                 unresolved_parent_arns.update(parent_arns)
                 continue
+
+            parent_arn, ambiguity_reason = _select_unambiguous_parent(
+                child_tags,
+                discovered_candidates,
+                parent_index,
+            )
+            if parent_arn is None:
+                resource['_parent_unresolved'] = True
+                resource['inheritance_unresolved_reason'] = ambiguity_reason or 'parent_unresolved'
+                unresolved_reason_counts[resource['inheritance_unresolved_reason']] += 1
+                continue
             resource['parent_arn'] = parent_arn
 
-            # Fill missing keys only — child's own tags always take precedence.
-            # aws:* prefixed tags are never propagated (they'd fail writes anyway).
-            inherited = {
-                k: v for k, v in parent_index[parent_arn].items()
-                if k not in resource['tags'] and not k.startswith('aws:')
-            }
+            inherited = _project_inherited_tags(resource['tags'], parent_index[parent_arn])
             if inherited:
                 resource['inherited_tags'].update(inherited)
 
@@ -412,31 +456,31 @@ def get_all_resources(
                 f"returned tag mappings"
             )
 
-        unresolved_reason_counts = defaultdict(int)
         for resource, parent_arns in unresolved_resources:
-            parent_arn = next(
-                (
-                    p for p in parent_arns
-                    if tagapi_status_by_arn.get(p) in {'resolved_with_tags', 'resolved_no_tags'}
-                ),
-                None
-            )
-            parent_tags = external_parent_tags.get(parent_arn) if parent_arn else None
+            resolved_candidates = []
+            resolved_tag_map = {}
+            resolved_source = {}
+            for candidate in parent_arns:
+                if tagapi_status_by_arn.get(candidate) in {'resolved_with_tags', 'resolved_no_tags'}:
+                    resolved_candidates.append(candidate)
+                    resolved_tag_map[candidate] = external_parent_tags.get(candidate, {})
+                    resolved_source[candidate] = 'external'
+                    continue
+                if native_status_by_arn.get(candidate) in {'resolved_with_tags', 'resolved_no_tags'}:
+                    resolved_candidates.append(candidate)
+                    resolved_tag_map[candidate] = native_parent_tags.get(candidate, {})
+                    resolved_source[candidate] = 'native'
 
-            if parent_arn is None:
-                parent_arn = next(
-                    (
-                        p for p in parent_arns
-                        if native_status_by_arn.get(p) in {'resolved_with_tags', 'resolved_no_tags'}
-                    ),
-                    None
-                )
-                parent_tags = native_parent_tags.get(parent_arn) if parent_arn else None
+            parent_arn, ambiguity_reason = _select_unambiguous_parent(
+                resource.get('tags', {}),
+                resolved_candidates,
+                resolved_tag_map,
+            )
 
             if parent_arn is None:
                 # Parent still unresolved (not taggable, not visible, or missing perms)
                 resource['_parent_unresolved'] = True
-                reason = classify_unresolved_inheritance_reason(
+                reason = ambiguity_reason or classify_unresolved_inheritance_reason(
                     parent_arns,
                     tagapi_status_by_arn,
                     native_status_by_arn,
@@ -446,17 +490,13 @@ def get_all_resources(
                 continue
 
             resource['parent_arn'] = parent_arn
-            parent_tags = parent_tags or {}
-
-            inherited = {
-                k: v for k, v in parent_tags.items()
-                if k not in resource['tags'] and not k.startswith('aws:')
-            }
+            parent_tags = resolved_tag_map.get(parent_arn) or {}
+            inherited = _project_inherited_tags(resource['tags'], parent_tags)
             if inherited:
                 resource['inherited_tags'].update(inherited)
-                if parent_arn in external_parent_tags:
+                if resolved_source.get(parent_arn) == 'external':
                     inherited_from_external_parent += 1
-                elif parent_arn in native_parent_tags:
+                elif resolved_source.get(parent_arn) == 'native':
                     inherited_from_native_parent += 1
 
         stats['inherited_from_external_parent'] = inherited_from_external_parent

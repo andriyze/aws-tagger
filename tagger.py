@@ -1329,6 +1329,9 @@ def main():
     # Validate tag args BEFORE discovery — fail fast on bad input
     tags, replace_rules = validate_tag_args(args.tag, args.replace)
 
+    if args.expected_account_id and not re.fullmatch(r'\d{12}', args.expected_account_id):
+        _arg_error("--expected-account-id must be a 12-digit AWS account ID")
+
     # Validate worker counts — ThreadPoolExecutor raises ValueError on 0 workers
     if args.tag_fetch_workers < 1 or args.tag_discovery_workers < 1:
         _arg_error("--tag-fetch-workers and --tag-discovery-workers must be >= 1")
