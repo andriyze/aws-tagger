@@ -93,15 +93,10 @@ def _resolve_expected_account_id(args):
 
 
 def _enforce_write_account_guard(args, get_account_identity):
-    """Fail closed before writes unless target account is explicitly verified."""
+    """Verify target account when an explicit expected account is configured."""
     expected_account_id, source = _resolve_expected_account_id(args)
     if not expected_account_id:
-        print(
-            "ERROR: refusing write operation without explicit target account guard. "
-            "Pass --expected-account-id <12-digit-account-id>.",
-            file=sys.stderr,
-        )
-        sys.exit(2)
+        return
     if not re.fullmatch(r'\d{12}', expected_account_id):
         print(
             f"ERROR: expected target account ID must be 12 digits (got '{expected_account_id}')",

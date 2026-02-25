@@ -69,8 +69,8 @@ Examples:
                         help='Skip interactive confirmation prompts and allow write operations '
                              'in non-interactive environments (use with care).')
     parser.add_argument('--expected-account-id', metavar='ACCOUNT_ID',
-                        help='12-digit AWS account ID required for non-dry-run writes. '
-                             'Writes are refused if current caller identity does not match.')
+                        help='Optional 12-digit AWS account ID guard for non-dry-run writes. '
+                             'When set, writes are refused if current caller identity does not match.')
     parser.add_argument('--allow-partial-discovery-write', action='store_true',
                         help='Allow non-dry-run writes even when discovery may be partial '
                              '(for example RE 1000-result caps, unindexed RE regions, '
